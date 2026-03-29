@@ -141,8 +141,8 @@ CITY_ALIASES = {
     "philly": "philadelphia", "vegas": "las-vegas", "nashvegas": "nashville",
 }
 
-DEFAULT_TIMEOUT = 10
-FETCH_TIMEOUT = 30
+DEFAULT_TIMEOUT = 15
+FETCH_TIMEOUT = 60
 
 
 def normalize_state(state: str) -> str:
