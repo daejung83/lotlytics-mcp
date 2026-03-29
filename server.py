@@ -170,7 +170,9 @@ def normalize_city_input(city: str, state: str) -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def fetch_market(region_id: str) -> dict | None:
+INVALID_API_KEY_SENTINEL = "__invalid_api_key__"
+
+async def fetch_market(region_id: str) -> dict | None | str:
     async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
         try:
             r = await client.get(
@@ -182,6 +184,8 @@ async def fetch_market(region_id: str) -> dict | None:
                     return r.json()
                 except Exception:
                     return None
+            if r.status_code in (401, 403):
+                return INVALID_API_KEY_SENTINEL
         except httpx.HTTPError:
             pass
     return None
@@ -356,6 +360,13 @@ async def get_market_summary(city: str, state: str) -> str:
 
     data = await fetch_market(region_id)
 
+    if data == INVALID_API_KEY_SENTINEL:
+        return (
+            "**Invalid API key.** Your `X-API-Key` was not accepted.\n\n"
+            "Check your key at [lotlytics.us/settings/api-keys](https://lotlytics.us/settings/api-keys) "
+            "and make sure you're on the Investor plan."
+        )
+
     if not data:
         state_abbr = normalize_state(state)
         city_safe = re.sub(r"[^a-z0-9]", "", city.strip().lower())[:4]
@@ -518,6 +529,12 @@ async def get_market_health(city: str, state: str) -> str:
         )
 
     data = await fetch_market(region_id)
+    if data == INVALID_API_KEY_SENTINEL:
+        return (
+            "**Invalid API key.** Your `X-API-Key` was not accepted.\n\n"
+            "Check your key at [lotlytics.us/settings/api-keys](https://lotlytics.us/settings/api-keys) "
+            "and make sure you're on the Investor plan."
+        )
     if not data:
         return f"Market not found for '{city}, {state}'. Try list_markets to find available cities."
 
