@@ -177,7 +177,7 @@ async def fetch_market(region_id: str, use_key: bool = True) -> dict | None | st
     async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
         try:
             r = await client.get(
-                f"{LOTLYTICS_API}/api/v1/city/{region_id}/summary",
+                f"{LOTLYTICS_API}/public/v1/markets/{region_id}/summary",
                 headers=headers
             )
             if r.status_code == 200:
@@ -198,7 +198,7 @@ async def search_similar_markets(partial: str, state_abbr: str) -> list[str]:
         return []
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            r = await client.get(f"{LOTLYTICS_API}/api/v1/regions/list", headers=api_headers())
+            r = await client.get(f"{LOTLYTICS_API}/public/v1/regions", headers=api_headers())
             if r.status_code != 200:
                 return []
             all_markets = r.json()
@@ -478,7 +478,7 @@ async def list_markets(state: str = "") -> str:
     premium = is_premium()
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            r = await client.get(f"{LOTLYTICS_API}/api/v1/regions/list", headers=api_headers())
+            r = await client.get(f"{LOTLYTICS_API}/public/v1/regions", headers=api_headers())
             if r.status_code != 200:
                 return "Failed to fetch market list — please try again."
             markets = r.json()
@@ -624,8 +624,8 @@ async def compare_markets(city_a: str, state_a: str, city_b: str, state_b: str) 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             results = await asyncio.gather(
-                client.get(f"{LOTLYTICS_API}/api/v1/city/{id_a}/summary", headers=api_headers()),
-                client.get(f"{LOTLYTICS_API}/api/v1/city/{id_b}/summary", headers=api_headers()),
+                client.get(f"{LOTLYTICS_API}/public/v1/markets/{id_a}/summary", headers=api_headers()),
+                client.get(f"{LOTLYTICS_API}/public/v1/markets/{id_b}/summary", headers=api_headers()),
                 return_exceptions=True
             )
     except Exception as e:
@@ -697,7 +697,7 @@ async def search_markets(
 
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            r = await client.get(f"{LOTLYTICS_API}/api/v1/regions/list", headers=api_headers())
+            r = await client.get(f"{LOTLYTICS_API}/public/v1/regions", headers=api_headers())
             if r.status_code != 200:
                 return "Failed to fetch market list."
             all_markets = r.json()
