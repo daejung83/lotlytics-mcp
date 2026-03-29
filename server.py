@@ -172,12 +172,13 @@ def normalize_city_input(city: str, state: str) -> str:
 
 INVALID_API_KEY_SENTINEL = "__invalid_api_key__"
 
-async def fetch_market(region_id: str) -> dict | None | str:
+async def fetch_market(region_id: str, use_key: bool = True) -> dict | None | str:
+    headers = api_headers() if use_key else {}
     async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
         try:
             r = await client.get(
                 f"{LOTLYTICS_API}/api/v1/city/{region_id}/summary",
-                headers=api_headers()
+                headers=headers
             )
             if r.status_code == 200:
                 try:
@@ -360,6 +361,11 @@ async def get_market_summary(city: str, state: str) -> str:
 
     data = await fetch_market(region_id)
 
+    # Bad key but free market — retry without auth, serve free tier response
+    if data == INVALID_API_KEY_SENTINEL and region_id in FREE_MARKETS:
+        data = await fetch_market(region_id, use_key=False)
+        premium = False  # force free tier response format
+
     if data == INVALID_API_KEY_SENTINEL:
         return (
             "**Invalid API key.** Your `X-API-Key` was not accepted.\n\n"
@@ -529,6 +535,12 @@ async def get_market_health(city: str, state: str) -> str:
         )
 
     data = await fetch_market(region_id)
+
+    # Bad key but free market — retry without auth
+    if data == INVALID_API_KEY_SENTINEL and region_id in FREE_MARKETS:
+        data = await fetch_market(region_id, use_key=False)
+        premium = False
+
     if data == INVALID_API_KEY_SENTINEL:
         return (
             "**Invalid API key.** Your `X-API-Key` was not accepted.\n\n"
