@@ -1,5 +1,7 @@
 # Lotlytics MCP Server
 
+[![SafeSkill 92/100](https://img.shields.io/badge/SafeSkill-92%2F100_Verified%20Safe-brightgreen)](https://safeskill.dev/scan/daejung83-lotlytics-mcp)
+
 > Real estate market data for any MCP-compatible AI assistant — Claude, Cursor, Windsurf, and more.
 
 Ask your AI questions like:
