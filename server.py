@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Lotlytics MCP Server
-Exposes real estate market data to any MCP-compatible AI assistant.
+Lotlytics MCP Server — Single unified server (free + premium)
 
-Free tier:  No auth, IP rate limited, watermarked
-Premium:    Requires LOTLYTICS_API_KEY env var (Investor+ plan)
+Free tier:   No API key needed. Top 50 markets, 3 tools, watermarked.
+Premium:     Pass X-API-Key (or Authorization: Bearer) header.
+             Unlocks all 895 markets + compare + search tools.
 
 Run:
-  python server.py --mode free    # Free MCP (stdio)
-  python server.py --mode premium # Premium MCP (stdio)
-  python server.py --mode free --transport sse --port 8080  # HTTP server
+  python server.py                                    # stdio (free/premium auto-detected per request)
+  python server.py --transport sse --port 8080        # SSE server
 """
 
 import argparse
 import asyncio
+import contextvars
 import os
 import re
 import httpx
@@ -24,9 +24,67 @@ from mcp.server.fastmcp import FastMCP
 # ---------------------------------------------------------------------------
 
 LOTLYTICS_API = "https://api.lotlytics.us"
-LOTLYTICS_API_KEY = os.environ.get("LOTLYTICS_API_KEY") or os.environ.get("LOTLYTICS_INTERNAL_KEY")
 
-# Free tier: top 50 major US metros only
+# Fallback env key (used when no per-request key is present)
+_ENV_API_KEY = os.environ.get("LOTLYTICS_API_KEY") or os.environ.get("LOTLYTICS_INTERNAL_KEY")
+
+# ---------------------------------------------------------------------------
+# Per-request API key (set by middleware on each SSE/HTTP request)
+# ---------------------------------------------------------------------------
+
+_api_key_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("api_key", default=None)
+
+
+def get_request_api_key() -> str | None:
+    """Return the API key for the current request (header > env fallback)."""
+    return _api_key_var.get() or _ENV_API_KEY
+
+
+def is_premium() -> bool:
+    """True if a valid-looking API key is available for this request."""
+    key = get_request_api_key()
+    return bool(key and len(key) > 10)
+
+
+def api_headers() -> dict:
+    """Return Authorization headers for Lotlytics API calls."""
+    key = get_request_api_key()
+    if key:
+        return {"Authorization": f"Bearer {key}"}
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Middleware — injects X-API-Key / Bearer token into ContextVar
+# ---------------------------------------------------------------------------
+
+class ApiKeyMiddleware:
+    """ASGI middleware that extracts X-API-Key (or Bearer token) per request."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            headers = {k.lower(): v for k, v in scope.get("headers", [])}
+            api_key = headers.get(b"x-api-key", b"").decode("utf-8", errors="ignore").strip()
+            if not api_key:
+                auth = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
+                if auth.lower().startswith("bearer "):
+                    api_key = auth[7:].strip()
+            token = _api_key_var.set(api_key or None)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _api_key_var.reset(token)
+        else:
+            await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
+# Free tier market list
+# ---------------------------------------------------------------------------
+
 FREE_MARKETS = {
     "new-york-ny", "los-angeles-ca", "chicago-il", "dallas-tx", "houston-tx",
     "washington-dc", "miami-fl", "philadelphia-pa", "atlanta-ga", "phoenix-az",
@@ -40,8 +98,11 @@ FREE_MARKETS = {
     "birmingham-al", "providence-ri", "milwaukee-wi", "tucson-az", "fresno-ca",
 }
 
+# ---------------------------------------------------------------------------
+# CTAs / watermarks
+# ---------------------------------------------------------------------------
+
 def upgrade_cta(city_name: str, signal: str = None) -> str:
-    """Generate a contextual upgrade CTA based on what data we withheld."""
     if signal:
         return (
             f"\n\n💡 *{city_name} is showing {signal} — see which ZIP codes are bucking the trend.*  \n"
@@ -55,7 +116,7 @@ def upgrade_cta(city_name: str, signal: str = None) -> str:
 PREMIUM_WATERMARK = "\n\n*Powered by [Lotlytics](https://lotlytics.us) · Investor Plan*"
 
 # ---------------------------------------------------------------------------
-# Shared state abbreviation lookup (single source of truth)
+# State / city normalization
 # ---------------------------------------------------------------------------
 
 STATE_ABBREVS = {
@@ -75,36 +136,24 @@ STATE_ABBREVS = {
 }
 
 CITY_ALIASES = {
-    "new york city": "new-york",
-    "nyc": "new-york",
-    "la": "los-angeles",
-    "sf": "san-francisco",
-    "dc": "washington",
-    "washington dc": "washington",
-    "philly": "philadelphia",
-    "vegas": "las-vegas",
-    "nashvegas": "nashville",
+    "new york city": "new-york", "nyc": "new-york", "la": "los-angeles",
+    "sf": "san-francisco", "dc": "washington", "washington dc": "washington",
+    "philly": "philadelphia", "vegas": "las-vegas", "nashvegas": "nashville",
 }
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+DEFAULT_TIMEOUT = 10
+FETCH_TIMEOUT = 30
 
-DEFAULT_TIMEOUT = 10   # seconds for list/search calls
-FETCH_TIMEOUT = 30    # seconds for individual city fetches (Railway cold start)
 
 def normalize_state(state: str) -> str:
-    """Convert any state format to 2-letter abbreviation. Validates output."""
     s = state.strip().lower()[:50]
     abbr = s if len(s) == 2 else STATE_ABBREVS.get(s, s[:2])
-    # Strict validation: must be exactly two lowercase ASCII letters
     if not re.fullmatch(r"[a-z]{2}", abbr):
-        return "xx"  # safe sentinel — will produce a not-found result
+        return "xx"
     return abbr
 
 
 def normalize_city_input(city: str, state: str) -> str:
-    """Convert city/state to Lotlytics regionId slug."""
     city = city.strip()[:100]
     state = state.strip()[:50]
     if not city or not state:
@@ -117,16 +166,11 @@ def normalize_city_input(city: str, state: str) -> str:
         return "unknown-xx"
     return f"{city_slug}-{state_abbr}"
 
-
-def api_headers() -> dict:
-    """Return headers for Lotlytics API calls, including auth if available."""
-    if LOTLYTICS_API_KEY:
-        return {"Authorization": f"Bearer {LOTLYTICS_API_KEY}"}
-    return {}
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 async def fetch_market(region_id: str) -> dict | None:
-    """Fetch market summary from Lotlytics API."""
     async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
         try:
             r = await client.get(
@@ -140,32 +184,23 @@ async def fetch_market(region_id: str) -> dict | None:
                     return None
         except httpx.HTTPError:
             pass
-        return None
+    return None
 
 
 async def search_similar_markets(partial: str, state_abbr: str) -> list[str]:
-    """Find similar market names for helpful error messages."""
-    # Sanitize partial — use only alphanumeric chars
     safe_partial = re.sub(r"[^a-z0-9]", "", partial.lower())[:4]
     if not safe_partial:
         return []
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            r = await client.get(
-                f"{LOTLYTICS_API}/api/v1/regions/list",
-                headers=api_headers()
-            )
+            r = await client.get(f"{LOTLYTICS_API}/api/v1/regions/list", headers=api_headers())
             if r.status_code != 200:
                 return []
-            try:
-                all_markets = r.json()
-            except Exception:
-                return []
+            all_markets = r.json()
             return [
                 m["regionId"] for m in all_markets
                 if state_abbr in m["regionId"] and (
-                    safe_partial in m.get("name", "").lower() or
-                    safe_partial in m["regionId"]
+                    safe_partial in m.get("name", "").lower() or safe_partial in m["regionId"]
                 )
             ][:5]
     except httpx.HTTPError:
@@ -194,7 +229,6 @@ def format_pct(val: float | None) -> str:
 
 
 def winner(val_a, val_b, higher_is_better=True):
-    """Return winner markers for comparison tables."""
     if val_a is None or val_b is None:
         return "—", "—"
     if higher_is_better:
@@ -204,7 +238,6 @@ def winner(val_a, val_b, higher_is_better=True):
 
 
 def interpret_market(metrics: dict) -> str:
-    """Generate AI-friendly narrative interpretation of a market."""
     lines = []
     appr = metrics.get("appreciation")
     momentum = metrics.get("marketMomentum", {}) or {}
@@ -243,7 +276,6 @@ def interpret_market(metrics: dict) -> str:
         elif p2i < 3:
             lines.append(f"Affordable relative to local incomes (price-to-income: {p2i:.1f}x).")
 
-    # Migration: use the label as-is, add context only for positive patterns
     if migration:
         ratio_label = migration.get("ratioLabel", "")
         net_returns = migration.get("netReturns", 0) or 0
@@ -251,7 +283,6 @@ def interpret_market(metrics: dict) -> str:
             suffix = " (net population gain)" if net_returns > 0 else " (net population loss)" if net_returns < 0 else ""
             lines.append(f"Migration: {ratio_label}{suffix}.")
 
-    # Net verdict
     bullish = sum([
         (appr or 0) > 2,
         (yield_ or 0) > 5,
@@ -275,50 +306,51 @@ def interpret_market(metrics: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# MCP Server — Free Tier
+# Single MCP server
 # ---------------------------------------------------------------------------
 
 _HOST = os.environ.get("HOST", "0.0.0.0")
 _PORT = int(os.environ.get("PORT", 8080))
-_MODE = os.environ.get("MCP_MODE", "free")  # Set via env or --mode arg
 
-free_mcp = FastMCP(
-    "Lotlytics Free",
+mcp = FastMCP(
+    "Lotlytics",
     host=_HOST,
     port=_PORT,
     instructions="""
 You have access to Lotlytics real estate market data for 895 US cities and metros.
-Start with get_market_health for quick screening, then get_market_summary for the full picture.
-Use list_markets to discover available cities or when a city search fails.
-For ZIP-level data, rent analysis, HUD fair market rents, and market comparison, users need the Investor plan at lotlytics.us/pricing.
+Free tier covers the top 50 markets — no API key needed.
+With an X-API-Key header (Investor plan), all 895 markets and advanced tools are unlocked.
+Start with get_market_health for quick screening, then get_market_summary for full details.
+Use compare_markets or search_markets for deeper investment research (requires API key).
 """.strip()
 )
 
 
-@free_mcp.tool(
+# ---------------------------------------------------------------------------
+# Tool: get_market_summary
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
     description="""Get a real estate market summary for a US city or metro area.
-Returns median home price, year-over-year appreciation, rental yield, market momentum,
-affordability score, and migration trends.
-Use this when someone asks about a housing market, whether to invest in a city,
-or wants to understand real estate conditions in a specific location.
-Tip: use get_market_health first for a quick score, then this for the full picture.
-Input: city name (e.g. 'Austin', 'New York City') and state (full name or 2-letter abbreviation).
+Returns median home price, appreciation, rental yield, market momentum, and migration trends.
+Free tier: top 50 markets. With API key: all 895 US metros.
+Use get_market_health first for a quick score, then this for the full picture.
 """
 )
 async def get_market_summary(city: str, state: str) -> str:
     region_id = normalize_city_input(city, state)
+    premium = is_premium()
 
-    # Free tier: top 50 markets only
-    if region_id not in FREE_MARKETS:
+    # Free tier market gate
+    if not premium and region_id not in FREE_MARKETS:
         state_abbr = normalize_state(state)
         city_safe = re.sub(r"[^a-z0-9]", "", city.strip().lower())[:4]
         similar = [m for m in await search_similar_markets(city_safe, state_abbr) if m in FREE_MARKETS]
         msg = f"**{city}, {state}** is not available on the free tier (top 50 markets only)."
         if similar:
-            msg += f" Try one of these free markets nearby: {', '.join(similar)}"
+            msg += f" Try one of these nearby: {', '.join(similar)}"
         msg += (
-            f"\n\n💡 *Unlock all 895 markets including {city} with the Investor plan.*  \n"
-            f"[See pricing →](https://lotlytics.us/pricing)"
+            f"\n\n💡 *Unlock all 895 markets including {city} — add your API key from [lotlytics.us/settings/api-keys](https://lotlytics.us/settings/api-keys).*"
         )
         return msg
 
@@ -330,7 +362,7 @@ async def get_market_summary(city: str, state: str) -> str:
         similar = await search_similar_markets(city_safe, state_abbr)
         msg = f"Market not found for '{city}, {state}'."
         if similar:
-            msg += f" Did you mean one of these? {', '.join(similar)}"
+            msg += f" Did you mean: {', '.join(similar)}?"
         else:
             msg += f" Try list_markets with state='{state}' to see available markets."
         return msg
@@ -340,16 +372,61 @@ async def get_market_summary(city: str, state: str) -> str:
     momentum = m.get("marketMomentum", {}) or {}
     short_name = name.split(",")[0].split("-")[0].strip()
 
-    # Pick contextual CTA signal
-    appr = m.get("appreciation") or 0
-    if appr < -3:
-        cta_signal = f"a -{abs(appr):.1f}% price correction"
-    elif appr > 5:
-        cta_signal = f"+{appr:.1f}% appreciation"
-    else:
-        cta_signal = None
+    if premium:
+        # Full premium report
+        pct = m.get("percentiles", {}) or {}
+        migration = m.get("incomeMigration", {}) or {}
+        hud = m.get("hudFmr", {}) or {}
+        net_returns = migration.get("netReturns", "N/A")
+        net_returns_fmt = f"{net_returns:,}" if isinstance(net_returns, (int, float)) else "N/A"
 
-    return f"""## {name}
+        return f"""## {name} — Full Market Report
+
+**Prices & Appreciation**
+- Median home price: {format_currency(m.get('medianPrice'))} (top {100 - pct.get('medianPrice', 50)}% of US markets)
+- YoY appreciation: {format_pct(m.get('appreciation'))} ({pct.get('appreciation', 'N/A')}th percentile)
+- Price-to-income ratio: {m.get('priceToIncome', 'N/A')}x ({pct.get('priceToIncome', 'N/A')}th percentile)
+- Affordability score: {m.get('affordability', 'N/A')}/100
+
+**Rentals & Yield**
+- Median rent: {format_currency(m.get('latestRent'))}/mo
+- Rental yield: {m.get('rentalYield', 'N/A')}% ({pct.get('rentalYield', 'N/A')}th percentile)
+- Estimated mortgage (20% down): {format_currency(m.get('mortgagePayment'))}/mo
+
+**HUD Fair Market Rents (FY{hud.get('fiscalYear', 'N/A')})**
+- Studio: {format_currency(hud.get('fmr0br'))}/mo | 1BR: {format_currency(hud.get('fmr1br'))}/mo | 2BR: {format_currency(hud.get('fmr2br'))}/mo
+- 3BR: {format_currency(hud.get('fmr3br'))}/mo | 4BR: {format_currency(hud.get('fmr4br'))}/mo
+
+**Market Conditions**
+- Momentum: {momentum.get('label', 'N/A')} {momentum.get('emoji', '')}
+- Months of supply: {momentum.get('monthsSupply', 'N/A')}
+- Sale-to-list ratio: {momentum.get('saleToList', 'N/A')}
+- Price drop %: {momentum.get('priceDropPct', 'N/A')}%
+
+**People & Economy**
+- Median household income: {format_currency(m.get('medianIncome'))}
+- Migration pattern: {migration.get('ratioLabel', 'N/A')}
+- Net migration (tax filers): {net_returns_fmt}
+- Avg incoming AGI: {format_currency(migration.get('avgIncomingAgi'))}
+
+**Percentile Rankings (vs ~895 US markets)**
+- Appreciation: {pct.get('appreciation', 'N/A')}th | Rental yield: {pct.get('rentalYield', 'N/A')}th
+- Net migration: {pct.get('netMigration', 'N/A')}th | Employment: {pct.get('unemploymentRate', 'N/A')}th
+
+**Analysis**
+{interpret_market(m)}
+{PREMIUM_WATERMARK}"""
+
+    else:
+        # Free tier report
+        appr = m.get("appreciation") or 0
+        cta_signal = None
+        if appr < -3:
+            cta_signal = f"a -{abs(appr):.1f}% price correction"
+        elif appr > 5:
+            cta_signal = f"+{appr:.1f}% appreciation"
+
+        return f"""## {name}
 
 **Prices**
 - Median home price: {format_currency(m.get('medianPrice'))}
@@ -370,27 +447,24 @@ async def get_market_summary(city: str, state: str) -> str:
 {upgrade_cta(short_name, cta_signal)}"""
 
 
-@free_mcp.tool(
-    description="""List available real estate markets in Lotlytics.
-Use this when you need to know which cities/metros are available, or when a city search fails.
-Optionally filter by state (2-letter abbreviation or full state name).
-Calling with no filters returns all 895 available markets.
-Returns market names and their IDs.
+# ---------------------------------------------------------------------------
+# Tool: list_markets
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    description="""List available real estate markets.
+Free tier: top 50 US metros. With API key: all 895 markets.
+Optionally filter by state (2-letter abbreviation or full name).
 """
 )
 async def list_markets(state: str = "") -> str:
+    premium = is_premium()
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            r = await client.get(
-                f"{LOTLYTICS_API}/api/v1/regions/list",
-                headers=api_headers()
-            )
+            r = await client.get(f"{LOTLYTICS_API}/api/v1/regions/list", headers=api_headers())
             if r.status_code != 200:
                 return "Failed to fetch market list — please try again."
-            try:
-                markets = r.json()
-            except Exception:
-                return "Failed to parse market list — please try again."
+            markets = r.json()
     except httpx.HTTPError:
         return "Failed to fetch market list — network error."
 
@@ -401,38 +475,49 @@ async def list_markets(state: str = "") -> str:
     if not markets:
         return f"No markets found for state '{state}'. Check spelling or try a 2-letter state code."
 
-    # Free tier: only show markets in FREE_MARKETS set
-    free_markets_filtered = [m for m in markets if m["regionId"] in FREE_MARKETS]
-    total_available = len(markets)
-    total_free = len(free_markets_filtered)
+    if premium:
+        lines = [f"**{len(markets)} markets available{' in ' + state.title() if state else ''}:**\n"]
+        for m in markets[:50]:
+            lines.append(f"- {m.get('name', m['regionId'])} (`{m['regionId']}`)")
+        if len(markets) > 50:
+            lines.append(f"\n…and {len(markets) - 50} more. Filter by state to see all.")
+        lines.append(PREMIUM_WATERMARK)
+        return "\n".join(lines)
+    else:
+        free = [m for m in markets if m["regionId"] in FREE_MARKETS]
+        lines = [f"**{len(free)} free markets{' in ' + state.title() if state else ''} (of {len(markets)} total):**\n"]
+        for m in free[:20]:
+            lines.append(f"- {m.get('name', m['regionId'])} (`{m['regionId']}`)")
+        if len(markets) > len(free):
+            lines.append(
+                f"\n💡 *{len(markets) - len(free)} more markets available with Investor plan.*  \n"
+                f"[Unlock all {len(markets)} markets →](https://lotlytics.us/pricing)"
+            )
+        return "\n".join(lines)
 
-    display = free_markets_filtered if free_markets_filtered else markets[:10]
 
-    lines = [f"**{total_free} free markets available{' in ' + state.title() if state else ''}** (of {total_available} total):\n"]
-    for m in display[:20]:
-        lines.append(f"- {m.get('name', m['regionId'])} (`{m['regionId']}`)")
+# ---------------------------------------------------------------------------
+# Tool: get_market_health
+# ---------------------------------------------------------------------------
 
-    if total_available > total_free:
-        lines.append(
-            f"\n💡 *{total_available - total_free} more markets available in {state.title() if state else 'the US'} with Investor plan.*  \n"
-            f"[Unlock all {total_available} markets →](https://lotlytics.us/pricing)"
-        )
-
-    return "\n".join(lines)
-
-
-@free_mcp.tool(
-    description="""Get a quick investment health score (1-10) for a real estate market.
+@mcp.tool(
+    description="""Get a quick investment health score (1-10) for a US real estate market.
 Returns a score with label (Strong Buy / Favorable / Neutral / Caution / Avoid) and key signals.
-Use this FIRST for quick screening before deciding whether to dig deeper with get_market_summary.
-Great for comparing multiple markets quickly or for yes/no investment questions.
-Input: city name and state.
+Use this FIRST for quick screening before digging deeper with get_market_summary.
+Free tier: top 50 markets. With API key: all 895 metros.
 """
 )
 async def get_market_health(city: str, state: str) -> str:
     region_id = normalize_city_input(city, state)
-    data = await fetch_market(region_id)
+    premium = is_premium()
 
+    if not premium and region_id not in FREE_MARKETS:
+        return (
+            f"**{city}, {state}** is not available on the free tier.\n\n"
+            f"💡 *Add your API key from [lotlytics.us/settings/api-keys](https://lotlytics.us/settings/api-keys) to unlock all 895 markets.*"
+        )
+
+    data = await fetch_market(region_id)
     if not data:
         return f"Market not found for '{city}, {state}'. Try list_markets to find available cities."
 
@@ -463,127 +548,47 @@ async def get_market_health(city: str, state: str) -> str:
     else:
         label, emoji = "Avoid", "🔴"
 
-    # Free tier: show score + top 2 signals only, hide the rest
-    appr_pct = pct.get('appreciation', 50)
-    migration_pct = pct.get('netMigration', 50)
-    top_signal = "strong migration demand" if migration_pct >= 75 else "weak appreciation" if appr_pct < 25 else "mixed signals"
-
-    return f"""## {name} — Market Health
+    result = f"""## {name} — Market Health
 
 {emoji} **{label}** ({score}/10)
 
-**Top signals:**
-- Appreciation: {format_pct(m.get('appreciation'))} YoY
-- Rental yield: {m.get('rentalYield', 'N/A')}%
-- Market momentum: {momentum.get('label', 'N/A')} {momentum.get('emoji', '')}
-
-*Score based on 5 factors vs ~895 US markets. Not investment advice.*
-
-💡 *{short_name} is scoring {label.lower()} — see the full breakdown including migration rank, employment percentile, and which ZIPs are outperforming.*  
-[Investor plan →](https://lotlytics.us/pricing)"""
-
-
-# ---------------------------------------------------------------------------
-# MCP Server — Premium Tier
-# ---------------------------------------------------------------------------
-
-premium_mcp = FastMCP(
-    "Lotlytics",
-    host=_HOST,
-    port=_PORT,
-    instructions="""
-You have full access to Lotlytics real estate market data for 895 US cities and metros.
-Data sources: Zillow, HUD (Fair Market Rents), IRS (migration), Census, BLS.
-Start with get_market_health for screening, get_market_summary_premium for full analysis,
-compare_markets for head-to-head, or search_markets to find markets by criteria.
-""".strip()
-)
-
-
-@premium_mcp.tool(
-    description="""Get a comprehensive real estate market summary for a US city or metro.
-Includes: prices, appreciation, rental yield, HUD fair market rents by bedroom count,
-affordability, market momentum, migration trends, income data, and percentile rankings vs all US markets.
-HUD Fair Market Rents are government-set rent benchmarks — particularly useful for Section 8 / voucher analysis.
-Use for deep market analysis, investment decisions, or detailed market questions.
-"""
-)
-async def get_market_summary_premium(city: str, state: str) -> str:
-    region_id = normalize_city_input(city, state)
-    data = await fetch_market(region_id)
-
-    if not data:
-        state_abbr = normalize_state(state)
-        city_safe = re.sub(r"[^a-z0-9]", "", city.strip().lower())[:4]
-        similar = await search_similar_markets(city_safe, state_abbr)
-        msg = f"Market not found for '{city}, {state}'."
-        if similar:
-            msg += f" Similar markets: {', '.join(similar)}"
-        return msg
-
-    m = data.get("metrics", {})
-    pct = m.get("percentiles", {}) or {}
-    momentum = m.get("marketMomentum", {}) or {}
-    migration = m.get("incomeMigration", {}) or {}
-    hud = m.get("hudFmr", {}) or {}
-    name = m.get("name", f"{city}, {state}")
-    net_returns = migration.get('netReturns', 'N/A')
-    net_returns_fmt = f"{net_returns:,}" if isinstance(net_returns, (int, float)) else "N/A"
-
-    return f"""## {name} — Full Market Report
-
-**Prices & Appreciation**
-- Median home price: {format_currency(m.get('medianPrice'))} (top {100 - pct.get('medianPrice', 50)}% of US markets)
-- YoY appreciation: {format_pct(m.get('appreciation'))} ({pct.get('appreciation', 'N/A')}th percentile)
-- Price-to-income ratio: {m.get('priceToIncome', 'N/A')}x ({pct.get('priceToIncome', 'N/A')}th percentile)
-- Affordability score: {m.get('affordability', 'N/A')}/100
-
-**Rentals & Yield**
-- Median rent: {format_currency(m.get('latestRent'))}/mo
+**Key signals:**
+- Appreciation: {format_pct(m.get('appreciation'))} YoY ({pct.get('appreciation', 'N/A')}th percentile)
 - Rental yield: {m.get('rentalYield', 'N/A')}% ({pct.get('rentalYield', 'N/A')}th percentile)
-- Rent-to-price ratio: {m.get('rentToPrice', 'N/A')}
-- Estimated mortgage (20% down): {format_currency(m.get('mortgagePayment'))}/mo
+- Market momentum: {momentum.get('label', 'N/A')} {momentum.get('emoji', '')}
+- Net migration: {pct.get('netMigration', 'N/A')}th percentile
+- Employment: {pct.get('unemploymentRate', 'N/A')}th percentile
 
-**HUD Fair Market Rents (FY{hud.get('fiscalYear', 'N/A')})**
-- Studio: {format_currency(hud.get('fmr0br'))}/mo
-- 1BR: {format_currency(hud.get('fmr1br'))}/mo
-- 2BR: {format_currency(hud.get('fmr2br'))}/mo
-- 3BR: {format_currency(hud.get('fmr3br'))}/mo
-- 4BR: {format_currency(hud.get('fmr4br'))}/mo
+*Score based on 5 factors vs ~895 US markets. Not investment advice.*"""
 
-**Market Conditions**
-- Momentum: {momentum.get('label', 'N/A')} {momentum.get('emoji', '')}
-- Months of supply: {momentum.get('monthsSupply', 'N/A')}
-- Sale-to-list ratio: {momentum.get('saleToList', 'N/A')}
-- Price drop %: {momentum.get('priceDropPct', 'N/A')}%
-- DOM YoY change: {momentum.get('domYoyChange', 'N/A')} days
+    if premium:
+        result += PREMIUM_WATERMARK
+    else:
+        result += (
+            f"\n\n💡 *{short_name} is scoring {label.lower()} — see ZIP-level breakdown and migration details.*  \n"
+            f"[Investor plan →](https://lotlytics.us/pricing)"
+        )
 
-**People & Economy**
-- Median household income: {format_currency(m.get('medianIncome'))}
-- Migration pattern: {migration.get('ratioLabel', 'N/A')}
-- Avg incoming AGI: {format_currency(migration.get('avgIncomingAgi'))}
-- Avg outgoing AGI: {format_currency(migration.get('avgOutgoingAgi'))}
-- Net migration (tax filers): {net_returns_fmt}
-
-**Percentile Rankings (vs ~895 US markets)**
-- Appreciation: {pct.get('appreciation', 'N/A')}th | Rental yield: {pct.get('rentalYield', 'N/A')}th
-- Net migration: {pct.get('netMigration', 'N/A')}th | Employment: {pct.get('unemploymentRate', 'N/A')}th
-- Climate risk: {pct.get('climateRisk', 'N/A')}th (lower = safer)
-
-**Analysis**
-{interpret_market(m)}
-{PREMIUM_WATERMARK}"""
+    return result
 
 
-@premium_mcp.tool(
-    description="""Compare two real estate markets side by side.
-Returns a structured comparison table with winners highlighted.
-Use when someone is deciding between two markets, or wants to understand
-relative strengths of two locations.
-For comparing 3+ markets at once, call this tool multiple times or use search_markets.
+# ---------------------------------------------------------------------------
+# Tool: compare_markets (premium only)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    description="""Compare two real estate markets side by side. Requires API key (Investor plan).
+Returns a head-to-head comparison with winners highlighted across price, yield, appreciation, and more.
+Use when deciding between two markets for investment.
 """
 )
 async def compare_markets(city_a: str, state_a: str, city_b: str, state_b: str) -> str:
+    if not is_premium():
+        return (
+            "**compare_markets requires an Investor plan API key.**\n\n"
+            "💡 *Add your X-API-Key header from [lotlytics.us/settings/api-keys](https://lotlytics.us/settings/api-keys) to unlock this tool.*"
+        )
+
     id_a = normalize_city_input(city_a, state_a)
     id_b = normalize_city_input(city_b, state_b)
 
@@ -598,10 +603,10 @@ async def compare_markets(city_a: str, state_a: str, city_b: str, state_b: str) 
         return f"Failed to fetch market data: {type(e).__name__}"
 
     r_a, r_b = results
-    if isinstance(r_a, Exception) or (hasattr(r_a, 'status_code') and r_a.status_code != 200):
-        return f"Market not found or unreachable: '{city_a}, {state_a}'"
-    if isinstance(r_b, Exception) or (hasattr(r_b, 'status_code') and r_b.status_code != 200):
-        return f"Market not found or unreachable: '{city_b}, {state_b}'"
+    if isinstance(r_a, Exception) or (hasattr(r_a, "status_code") and r_a.status_code != 200):
+        return f"Market not found: '{city_a}, {state_a}'"
+    if isinstance(r_b, Exception) or (hasattr(r_b, "status_code") and r_b.status_code != 200):
+        return f"Market not found: '{city_b}, {state_b}'"
 
     a = r_a.json().get("metrics", {})
     b = r_b.json().get("metrics", {})
@@ -634,15 +639,15 @@ async def compare_markets(city_a: str, state_a: str, city_b: str, state_b: str) 
 {PREMIUM_WATERMARK}"""
 
 
-@premium_mcp.tool(
-    description="""Search for real estate markets that match specific investment criteria.
-Use when someone wants to find markets based on conditions like:
-- 'Show me markets with rental yield above 6%'
-- 'Find affordable markets in Texas under $300k'
-- 'Best markets in the Southeast for appreciation'
-Calling with no filters returns the top-ranked markets nationally.
+# ---------------------------------------------------------------------------
+# Tool: search_markets (premium only)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    description="""Search for real estate markets matching specific investment criteria. Requires API key.
+Examples: 'markets in Texas under $300k with 6%+ yield', 'best appreciation in the Southeast'.
 Filters: state, max_price, min_appreciation, min_rental_yield, max_price_to_income.
-Returns top matching markets ranked by composite score (yield + appreciation - overvaluation).
+No filters = top-ranked markets nationally.
 """
 )
 async def search_markets(
@@ -653,14 +658,17 @@ async def search_markets(
     max_price_to_income: float = 999,
     limit: int = 10
 ) -> str:
-    limit = max(1, min(limit, 25))  # Hard cap
+    if not is_premium():
+        return (
+            "**search_markets requires an Investor plan API key.**\n\n"
+            "💡 *Add your X-API-Key header from [lotlytics.us/settings/api-keys](https://lotlytics.us/settings/api-keys) to unlock this tool.*"
+        )
+
+    limit = max(1, min(limit, 25))
 
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            r = await client.get(
-                f"{LOTLYTICS_API}/api/v1/regions/list",
-                headers=api_headers()
-            )
+            r = await client.get(f"{LOTLYTICS_API}/api/v1/regions/list", headers=api_headers())
             if r.status_code != 200:
                 return "Failed to fetch market list."
             all_markets = r.json()
@@ -672,10 +680,9 @@ async def search_markets(
         all_markets = [m for m in all_markets if m["regionId"].endswith(f"-{state_abbr}")]
 
     total_available = len(all_markets)
-    SAMPLE_SIZE = 20  # Balanced: responsive + representative
+    SAMPLE_SIZE = 20
     sample = all_markets[:SAMPLE_SIZE]
 
-    # Semaphore-limited concurrent fetches — keep low to avoid rate limiting our own backend
     semaphore = asyncio.Semaphore(3)
 
     async def fetch_one(region_id: str):
@@ -721,7 +728,7 @@ async def search_markets(
 
     sampling_note = ""
     if total_available > SAMPLE_SIZE:
-        sampling_note = f"\n⚠️ Sampled {SAMPLE_SIZE} of {total_available} available markets for performance. Filter by state for more complete results.\n"
+        sampling_note = f"\n⚠️ Sampled {SAMPLE_SIZE} of {total_available} available markets. Filter by state for more complete results.\n"
 
     lines = [f"**Top {len(results)} markets matching your criteria:**\n{sampling_note}"]
     for r in results:
@@ -735,12 +742,10 @@ async def search_markets(
 
 
 # ---------------------------------------------------------------------------
-# Health check middleware (for Railway/hosted deployments)
+# Health check endpoint
 # ---------------------------------------------------------------------------
 
 def add_health_endpoint(mcp_server: FastMCP):
-    """Inject a /health route into the FastMCP SSE app."""
-    from starlette.applications import Starlette
     from starlette.routing import Route
     from starlette.responses import JSONResponse
 
@@ -748,10 +753,16 @@ def add_health_endpoint(mcp_server: FastMCP):
 
     def patched_sse_app(mount_path=None):
         app = original_sse_app(mount_path)
+
         async def health(request):
             return JSONResponse({"status": "ok", "service": "lotlytics-mcp"})
-        # Prepend /health route
+
         app.routes.insert(0, Route("/health", health))
+
+        # Wrap with our API key middleware
+        app.middleware_stack = None  # reset so middleware is rebuilt
+        app.add_middleware(ApiKeyMiddleware)  # type: ignore
+
         return app
 
     mcp_server.sse_app = patched_sse_app
@@ -763,20 +774,16 @@ def add_health_endpoint(mcp_server: FastMCP):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["free", "premium"], default=os.environ.get("MCP_MODE", "free"))
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
 
     port = int(os.environ.get("PORT", args.port))
 
-    if args.mode == "premium" and not LOTLYTICS_API_KEY:
-        print("WARNING: LOTLYTICS_API_KEY not set — premium mode will make unauthenticated API calls", flush=True)
-
-    server = free_mcp if args.mode == "free" else premium_mcp
-    print(f"Starting Lotlytics {args.mode.title()} MCP (transport={args.transport}, port={port})")
+    print(f"Starting Lotlytics MCP (transport={args.transport}, port={port})", flush=True)
+    print(f"Mode: {'premium env key loaded' if _ENV_API_KEY else 'free (no env key)'}", flush=True)
 
     if args.transport in ("sse", "streamable-http"):
-        add_health_endpoint(server)
+        add_health_endpoint(mcp)
 
-    server.run(transport=args.transport)
+    mcp.run(transport=args.transport)
