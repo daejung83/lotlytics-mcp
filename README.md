@@ -21,8 +21,8 @@ Add to your Claude Desktop config:
 {
   "mcpServers": {
     "lotlytics": {
-      "type": "sse",
-      "url": "https://lotlytics-mcp-production.up.railway.app/sse"
+      "type": "streamable-http",
+      "url": "https://lotlytics-mcp-production.up.railway.app/mcp"
     }
   }
 }
@@ -40,8 +40,8 @@ Same URL, just add your API key as a header:
 {
   "mcpServers": {
     "lotlytics": {
-      "type": "sse",
-      "url": "https://lotlytics-mcp-production.up.railway.app/sse",
+      "type": "streamable-http",
+      "url": "https://lotlytics-mcp-production.up.railway.app/mcp",
       "headers": {
         "X-API-Key": "YOUR_API_KEY"
       }
@@ -90,10 +90,10 @@ Get your API key at [lotlytics.us/settings/api-keys](https://lotlytics.us/settin
 git clone https://github.com/daejung83/lotlytics-mcp
 cd lotlytics-mcp
 pip install -r requirements.txt
-python server.py --transport sse --port 8080
+python server.py --transport streamable-http --port 8080
 ```
 
-Or use the hosted SSE endpoint above — no local setup needed.
+Or use the hosted endpoint above — no local setup needed.
 
 ---
 
