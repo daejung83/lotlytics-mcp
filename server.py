@@ -774,9 +774,90 @@ async def search_markets(
 # Health check endpoint
 # ---------------------------------------------------------------------------
 
+SERVER_CARD = {
+    "serverInfo": {
+        "name": "Lotlytics",
+        "version": "1.0.0",
+        "description": "Live real estate market data for 895 US metros. Free tier covers top 50 markets (no key needed). Add X-API-Key for all 895 markets + premium tools."
+    },
+    "authentication": {
+        "required": False,
+        "schemes": []
+    },
+    "tools": [
+        {
+            "name": "get_market_health",
+            "description": "Investment health score (1-10) for a US real estate market. Free: top 50 metros. Premium (X-API-Key): all 895 metros.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "state": {"type": "string"}
+                },
+                "required": ["city", "state"]
+            }
+        },
+        {
+            "name": "get_market_summary",
+            "description": "Full market summary: prices, appreciation, rental yield, momentum, HUD rents (premium). Free: top 50 metros. Premium: all 895.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "state": {"type": "string"}
+                },
+                "required": ["city", "state"]
+            }
+        },
+        {
+            "name": "list_markets",
+            "description": "List available US real estate markets, optionally filtered by state. Free: top 50. Premium: all 895.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "state": {"type": "string"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "compare_markets",
+            "description": "Side-by-side comparison of two US markets. Requires X-API-Key (Investor plan).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "city_a": {"type": "string"},
+                    "state_a": {"type": "string"},
+                    "city_b": {"type": "string"},
+                    "state_b": {"type": "string"}
+                },
+                "required": ["city_a", "state_a", "city_b", "state_b"]
+            }
+        },
+        {
+            "name": "search_markets",
+            "description": "Filter 895 US markets by price, yield, appreciation, affordability. Requires X-API-Key (Investor plan).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "state": {"type": "string"},
+                    "max_price": {"type": "number"},
+                    "min_appreciation": {"type": "number"},
+                    "min_rental_yield": {"type": "number"},
+                    "max_price_to_income": {"type": "number"},
+                    "limit": {"type": "integer"}
+                },
+                "required": []
+            }
+        }
+    ]
+}
+
+
 def add_health_endpoint(mcp_server: FastMCP):
     from starlette.routing import Route
     from starlette.responses import JSONResponse
+    import json as _json
 
     original_sse_app = mcp_server.sse_app
 
@@ -786,7 +867,11 @@ def add_health_endpoint(mcp_server: FastMCP):
         async def health(request):
             return JSONResponse({"status": "ok", "service": "lotlytics-mcp"})
 
+        async def server_card(request):
+            return JSONResponse(SERVER_CARD)
+
         app.routes.insert(0, Route("/health", health))
+        app.routes.insert(1, Route("/.well-known/mcp/server-card.json", server_card))
 
         # Wrap with our API key middleware
         app.middleware_stack = None  # reset so middleware is rebuilt
