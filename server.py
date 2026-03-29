@@ -854,32 +854,42 @@ SERVER_CARD = {
 }
 
 
-def add_health_endpoint(mcp_server: FastMCP):
+def patch_app(app):
+    """Inject health, server-card routes and ApiKeyMiddleware into any Starlette app."""
     from starlette.routing import Route
     from starlette.responses import JSONResponse
-    import json as _json
 
-    original_sse_app = mcp_server.sse_app
+    async def health(request):
+        return JSONResponse({"status": "ok", "service": "lotlytics-mcp"})
 
-    def patched_sse_app(mount_path=None):
-        app = original_sse_app(mount_path)
+    async def server_card(request):
+        return JSONResponse(SERVER_CARD)
 
-        async def health(request):
-            return JSONResponse({"status": "ok", "service": "lotlytics-mcp"})
+    app.routes.insert(0, Route("/health", health))
+    app.routes.insert(1, Route("/.well-known/mcp/server-card.json", server_card))
 
-        async def server_card(request):
-            return JSONResponse(SERVER_CARD)
+    app.middleware_stack = None  # reset so middleware is rebuilt
+    app.add_middleware(ApiKeyMiddleware)  # type: ignore
+    return app
 
-        app.routes.insert(0, Route("/health", health))
-        app.routes.insert(1, Route("/.well-known/mcp/server-card.json", server_card))
 
-        # Wrap with our API key middleware
-        app.middleware_stack = None  # reset so middleware is rebuilt
-        app.add_middleware(ApiKeyMiddleware)  # type: ignore
+def add_health_endpoint(mcp_server: FastMCP, transport: str = "sse"):
+    if transport == "streamable-http":
+        original_app_fn = mcp_server.streamable_http_app
 
-        return app
+        def patched_streamable_app():
+            app = original_app_fn()
+            return patch_app(app)
 
-    mcp_server.sse_app = patched_sse_app
+        mcp_server.streamable_http_app = patched_streamable_app
+    else:
+        original_sse_app = mcp_server.sse_app
+
+        def patched_sse_app(mount_path=None):
+            app = original_sse_app(mount_path)
+            return patch_app(app)
+
+        mcp_server.sse_app = patched_sse_app
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +898,8 @@ def add_health_endpoint(mcp_server: FastMCP):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
+    parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"],
+                        default=os.environ.get("MCP_TRANSPORT", "streamable-http"))
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
 
@@ -898,6 +909,6 @@ if __name__ == "__main__":
     print(f"Mode: {'premium env key loaded' if _ENV_API_KEY else 'free (no env key)'}", flush=True)
 
     if args.transport in ("sse", "streamable-http"):
-        add_health_endpoint(mcp)
+        add_health_endpoint(mcp, transport=args.transport)
 
     mcp.run(transport=args.transport)
